@@ -94,7 +94,7 @@ The caller is identified by the `X-User-ID` header. `POST` also accepts `user_id
 | `GET /users/{user_id}/documents` | `page`, `page_size`, optional `status` | 200, 404 |
 | `GET /health` | Checks MongoDB and Redis | 200, 503 |
 
-## Design
+## Design decisions
 
 ### Code layout
 
@@ -156,15 +156,17 @@ Other indexes: `document_id` (unique), `content_hash`, and two for the list: `{u
 
 ## Assumptions
 
-- `POST` takes the user from the header or the body. If both are sent, they must match.
-- By-ref lookup also needs the owner's `X-User-ID`.
+- There's no login in the spec, so the `X-User-ID` header is trusted as the caller's identity. In a real system an auth gateway would set it.
+- `POST` takes the user from the header or from `user_id` in the body, since the spec lists `user_id` as a POST field. If both are sent, they must match.
+- "Unique when present" for `client_doc_ref` means unique across all users, not per user. A partner ref points to one document.
+- By-ref lookup also needs the owner's `X-User-ID`. Otherwise it would be a way around the ownership rule.
 - A 409 on a repeated ref tells the caller the ref exists. That's fine because refs are partner ids, not secrets, and nothing from the document is returned.
-- A repeat with the same ref and content but a different title returns 200 and keeps the original title.
-- A repeat for a document that `failed` returns 200 with `failed` and doesn't retry it. Retrying is done with PATCH.
-- A PATCH with the content the document already has does nothing, unless the document failed.
+- A repeat with the same ref and content but a different title returns 200 and keeps the original title. The content decides whether it's the same document, and changes go through PATCH.
+- A repeat for a document that `failed` returns 200 with `failed` and doesn't retry it. A repeated POST should be safe to send twice, so retrying is done with PATCH.
+- A PATCH with the content the document already has does nothing, because there's nothing new to process. The exception is a failed document, where it's a retry.
 - A PATCH on a finished document needs a free slot because it starts a new run. A PATCH on a document still in the pipeline keeps its current slot.
-- The cache is shared across users. The result only depends on the content.
-- It runs as a single API instance.
+- The cache is shared across users. The mock result only depends on the content, so there's nothing user-specific to leak.
+- It runs as a single API instance, because the pipeline runs as tasks inside the API process.
 
 ## Known limitations
 
@@ -172,16 +174,16 @@ Other indexes: `document_id` (unique), `content_hash`, and two for the list: `{u
 - If giving a slot back to Redis fails, the error is logged and the counter stays high until its 1 hour TTL runs out or the app restarts.
 - Pipeline tasks run inside the API process, so running several API instances isn't safe.
 
-## What I'd do with more time
+## What I would do differently with more time
 
 - Move the pipeline to a job queue with separate workers, so jobs survive crashes and the API can scale out.
 - Retry a failed stage automatically with backoff, instead of waiting for the caller to PATCH.
 - Metrics for queue depth, stage time, cache hit rate and 429s.
-- The pagination change from "At 100x".
+- The pagination change from "At 100×".
 
 ## Schema & Staleness Design
 
-Each document has an integer `version`. It goes up by 1 on every PATCH that starts a new run from processing: new content, or a retry after processing failed. Retrying only enriching keeps the version, because the stored summary was already made for it. `summary` and `tags` each store `source_version`, the version they were made from, and `source_hash`, the hash of that content.
+Each document has an integer `version`. It goes up by 1 on every PATCH that starts a new run from processing: new content, or a retry after processing failed. Retrying only enriching keeps the version, because the stored summary was already made for it. `summary` and `tags` each store `source_version`, the version they were made from, and `source_hash`, the hash of that content. The check below only uses the version. The hash is there so anyone reading the document can also compare it with `content_hash` and see the result belongs to this exact content.
 
 On the write side, every pipeline write filters on `document_id`, the version the run started with, and the status it expects, for example `{document_id, version: 2, status: "enriching"}`. If a PATCH moves the document to version 3 during a version 2 run, the rest of that run's writes match nothing and it stops. An old run can't write results onto new content.
 
@@ -189,32 +191,32 @@ On the read side, every endpoint builds its response with one function, `documen
 
 With both of these in place, a reader never sees a mismatch. Old results can't be written to a newer version, and even if the database held a v3 summary with v2 tags, the read would return neither.
 
-## At 100x
+## At 100×
 
-### What happens to the user_id indexes if one user has 500K documents?
+### What happens to the user_id-based indexes if a single user has 500K documents?
 
-Filtering by `user_id` was fine. The slow part was the sort. The list is sorted by `created_at` and then `_id`, newest first, and my first indexes (`{user_id, status}` and `{user_id, created_at}`) didn't match that order. When I ran `explain()` on the list query, MongoDB used the index to find the documents and then sorted them in memory. With 500K documents that means loading all of them to return 20, and it can hit the in-memory sort limit.
+Filtering by `user_id` was fine. The slow part was the sort. The list is sorted by `created_at` and then `_id`, newest first, and my first indexes (`{user_id, status}` and `{user_id, created_at}`) didn't match that order. When I ran `explain()` on the list query, MongoDB used the index to find the documents and then sorted them in memory. With 500K documents that means loading and sorting all of them to return 20.
 
-So I changed the indexes to end with the sort: `{user_id: 1, status: 1, created_at: -1, _id: -1}` for filtered lists and `{user_id: 1, created_at: -1, _id: -1}` for the rest. MongoDB now reads a page in order and stops after 20. What's left is the `total` count, which still goes through all of the user's entries on every page, so at that size I'd cache it or stop returning it.
+So I changed the indexes to end with the sort: `{user_id: 1, status: 1, created_at: -1, _id: -1}` for filtered lists and `{user_id: 1, created_at: -1, _id: -1}` for the rest. MongoDB now reads documents in the right order straight from the index, with no sort step. What's left is the `total` count, which still goes through all of the user's entries on every page, so at that size I'd cache it or stop returning it.
 
-### What would the shard key be?
+### What would the sharding key be, and why?
 
 I'd shard on `{user_id: 1, document_id: 1}`.
 
-I didn't go with just `user_id` because all of one user's documents would sit in a single chunk that MongoDB can't split, and one shard would take all of that user's traffic. With `document_id` added, a big user's documents can be spread over several chunks, and listing a user's documents still only goes to the shards that hold that user. GET by id already filters on both fields.
+I didn't go with just `user_id` because MongoDB can't split documents that share the same shard key value, so all of one user's documents would sit in one chunk, and one shard would take all of that user's traffic. With `document_id` added, a big user's documents can be spread over several chunks, and listing a user's documents still only goes to the shards that hold that user.
 
 I'd also have to change two things. The pipeline updates don't filter on `user_id` right now, so they'd go to every shard, and I'd add it. And MongoDB can't keep `client_doc_ref` unique on a collection sharded by a different key. I'd move the refs to a small separate collection (`client_doc_ref -> user_id, document_id`) sharded by hashed ref, and the by-ref lookup would check that first.
 
-### Does the Redis rate-limit counter still work at 100x submit QPS?
+### Does the Redis rate-limit counter still work at 100× submit QPS?
 
-The speed would be fine. Each acquire and release is one Lua script on one key per user, so it stays fast and atomic, and different users end up on different Redis nodes.
+The speed would be fine. Each acquire and release is one Lua script on one key per user, so it stays fast and atomic.
 
 The problem is that the count can drift. It's only correct if every job releases exactly once. If a process crashes or a release call fails, the user stays blocked until the one-hour TTL expires, and the counters are only rebuilt on startup.
 
 I'd use a sorted set per user instead of a counter, with one entry per job (`document_id:version`) and the expiry time as the score. Acquire removes expired entries and then checks the count. Release removes only that job's entry, so running it twice doesn't break anything. I'd also remove the MongoDB fallback, since at that traffic it would just push all the load onto the database.
 
-### Does skip/limit pagination still work?
+### Does skip/limit pagination still work for the list at that scale?
 
-It still returns the right results, but pages get slower the deeper you go, because `skip(n)` still reads the `n` skipped entries. Page 10,000 with 20 per page reads 200K entries only to throw them away. New documents also shift the pages, so you can see the same one twice.
+It still returns the right results, but pages get slower the deeper you go, because `skip(n)` still reads the `n` skipped entries. Page 10,000 reads 200K entries first. New documents also shift the pages, so you can see the same one twice.
 
 I'd switch to cursor pagination on `(created_at, _id)`. Each response includes the last item's pair, and the next request asks for everything older than it. With the new index, page 10,000 costs the same as page 1.
