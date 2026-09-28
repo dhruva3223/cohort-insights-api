@@ -1,0 +1,58 @@
+services:
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB: cohort_insights
+      REDIS_URL: redis://redis:6379/0
+      MAX_ACTIVE_PER_USER: "3"
+      RATE_LIMIT_KEY_TTL_S: "3600"
+      CACHE_TTL_S: "86400"
+      PROCESSING_MIN_S: "10"
+      PROCESSING_MAX_S: "20"
+      ENRICHING_MIN_S: "5"
+      ENRICHING_MAX_S: "15"
+      PROCESSING_FAILURE_RATE: "0.1"
+      ENRICHING_FAILURE_RATE: "0.1"
+      LOG_LEVEL: INFO
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
